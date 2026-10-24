@@ -1,10 +1,16 @@
-import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import type { PreloadSkillsConfig, ParsedSkill, PluginContext, Logger, ToastFn } from "./types.js"
 import { loadConfig } from "./config/loader.js"
 import { loadSkills, formatSkillsForInjection, calculateTotalTokens } from "./skills/loader.js"
 import { SkillResolverImpl, resolveSkillGroups } from "./skills/resolver.js"
 import { SessionManagerImpl } from "./session/manager.js"
-import { createHooks } from "./hooks"
+import {
+  createSystemPromptHook,
+  createPromptHook,
+  createToolExecuteAfterHook,
+  createCompactionHook,
+} from "./hooks/index.js"
+import { registerLoadedSkillsTool } from "./tools/loaded-skills.js"
 import { checkCondition } from "./utils.js"
 
 export type { PreloadSkillsConfig, ParsedSkill }
@@ -27,121 +33,128 @@ function resolveConditionalSkills(config: PreloadSkillsConfig, projectDir: strin
   return resolved
 }
 
-export const PreloadSkillsPlugin: Plugin = async (ctx: PluginInput) => {
-  const config = loadConfig(ctx.directory)
+export default Plugin.define({
+  id: "preload-skills",
+  async setup(ctx) {
+    const projectDir = ctx.location.directory
+    const config = loadConfig(projectDir)
 
-  const log: Logger = (level, message, extra) => {
-    if (level === "debug" && !config.debug) return
+    const log: Logger = (level, message, extra) => {
+      if (level === "debug" && !config.debug) return
+      const logFn =
+        level === "error"
+          ? console.error
+          : level === "warn"
+          ? console.warn
+          : level === "debug"
+          ? console.debug
+          : console.info
+      if (extra) {
+        logFn(`[preload-skills] ${message}`, extra)
+      } else {
+        logFn(`[preload-skills] ${message}`)
+      }
+    }
 
-    ctx.client.app.log({
-      body: {
-        service: "preload-skills",
-        level,
-        message,
-        extra,
-      },
+    const allInitialSkillNames = [
+      ...config.skills,
+      ...resolveConditionalSkills(config, projectDir),
+    ]
+
+    const resolvedInitialNames = resolveSkillGroups(allInitialSkillNames, config.groups ?? {})
+    let initialSkills = loadSkills(resolvedInitialNames, projectDir)
+    let initialTokensUsed = calculateTotalTokens(initialSkills)
+
+    if (config.maxTokens && initialTokensUsed > config.maxTokens) {
+      const { filterSkillsByTokenBudget } = await import("./skills/loader.js")
+      initialSkills = filterSkillsByTokenBudget(initialSkills, config.maxTokens)
+      initialTokensUsed = calculateTotalTokens(initialSkills)
+    }
+
+    const initialFormattedContent = formatSkillsForInjection(initialSkills, {
+      useSummaries: config.useSummaries,
+      useMinification: config.useMinification,
+      skillSettings: config.skillSettings,
     })
-  }
 
-  const allInitialSkillNames = [
-    ...config.skills,
-    ...resolveConditionalSkills(config, ctx.directory),
-  ]
+    if (initialSkills.length > 0) {
+      const loadedNames = initialSkills.map((s) => s.name)
+      const missingNames = allInitialSkillNames.filter(
+        (s) => !loadedNames.includes(s) && !s.startsWith("@")
+      )
 
-  const resolvedInitialNames = resolveSkillGroups(allInitialSkillNames, config.groups ?? {})
-  let initialSkills = loadSkills(resolvedInitialNames, ctx.directory)
-  let initialTokensUsed = calculateTotalTokens(initialSkills)
+      log("info", `Loaded ${initialSkills.length} initial skills`, {
+        loaded: loadedNames,
+        tokens: initialTokensUsed,
+        missing: missingNames.length > 0 ? missingNames : undefined,
+      })
+    }
 
-  if (config.maxTokens && initialTokensUsed > config.maxTokens) {
-    const { filterSkillsByTokenBudget } = await import("./skills/loader.js")
-    initialSkills = filterSkillsByTokenBudget(initialSkills, config.maxTokens)
-    initialTokensUsed = calculateTotalTokens(initialSkills)
-  }
+    const hasTriggeredSkills =
+      Object.keys(config.fileTypeSkills ?? {}).length > 0 ||
+      Object.keys(config.agentSkills ?? {}).length > 0 ||
+      Object.keys(config.pathPatterns ?? {}).length > 0 ||
+      Object.keys(config.contentTriggers ?? {}).length > 0
 
-  const initialFormattedContent = formatSkillsForInjection(initialSkills, {
-    useSummaries: config.useSummaries,
-    useMinification: config.useMinification,
-    skillSettings: config.skillSettings,
-  })
+    if (allInitialSkillNames.length === 0 && !hasTriggeredSkills) {
+      log("warn", "No skills configured. Create .opencode/preload-skills.json")
+    }
 
-  if (initialSkills.length > 0) {
-    const loadedNames = initialSkills.map((s) => s.name)
-    const missingNames = allInitialSkillNames.filter(
-      (s) => !loadedNames.includes(s) && !s.startsWith("@")
+    const sessionManager = new SessionManagerImpl(
+      config,
+      projectDir,
+      log,
+      new Set(initialSkills.map((s) => s.name)),
+      initialTokensUsed
     )
 
-    log("info", `Loaded ${initialSkills.length} initial skills`, {
-      loaded: loadedNames,
-      tokens: initialTokensUsed,
-      missing: missingNames.length > 0 ? missingNames : undefined,
-    })
-  }
+    for (const skill of initialSkills) {
+      sessionManager.cacheSkill(skill)
+    }
 
-  const hasTriggeredSkills =
-    Object.keys(config.fileTypeSkills ?? {}).length > 0 ||
-    Object.keys(config.agentSkills ?? {}).length > 0 ||
-    Object.keys(config.pathPatterns ?? {}).length > 0 ||
-    Object.keys(config.contentTriggers ?? {}).length > 0
+    const skillResolver = new SkillResolverImpl(config, projectDir)
 
-  if (allInitialSkillNames.length === 0 && !hasTriggeredSkills) {
-    log("warn", "No skills configured. Create .opencode/preload-skills.json")
-  }
+    const toast: ToastFn = (message, variant = "info") => {
+      if (!config.showToasts) return
+      log(variant === "error" ? "error" : variant === "warning" ? "warn" : "info", message)
+    }
 
-  const sessionManager = new SessionManagerImpl(
-    config,
-    ctx.directory,
-    log,
-    new Set(initialSkills.map((s) => s.name)),
-    initialTokensUsed
-  )
+    const pluginContext: PluginContext = {
+      config,
+      projectDir,
+      log,
+      toast,
+      sessionManager,
+      skillResolver,
+      initialSkills,
+      initialFormattedContent,
+      initialTokensUsed,
+    }
 
-  for (const skill of initialSkills) {
-    sessionManager.cacheSkill(skill)
-  }
+    ctx.session.hook("context", createSystemPromptHook(pluginContext))
+    ctx.session.hook("prompt", createPromptHook(pluginContext))
+    ctx.tool.hook("execute.after", createToolExecuteAfterHook(pluginContext))
+    ctx.session.hook("compaction", createCompactionHook(pluginContext))
 
-  const skillResolver = new SkillResolverImpl(config, ctx.directory)
+    if (config.enableTools !== false) {
+      ctx.tool.transform((editor) => {
+        registerLoadedSkillsTool(editor, sessionManager, toast)
+      })
+    }
 
-  const toast: ToastFn = (message, variant = "info") => {
-    if (!config.showToasts) return
-    ctx.client.tui.showToast({
-      body: { message, variant, duration: 3000 },
-    })
-  }
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event.type === "session.deleted") {
+            sessionManager.cleanup(event.data.sessionID)
+          }
+        }
+      } catch {
+        // Aborted on cleanup
+      }
+    })()
 
-  const pluginContext: PluginContext = {
-    config,
-    projectDir: ctx.directory,
-    log,
-    toast,
-    sessionManager,
-    skillResolver,
-    initialSkills,
-    initialFormattedContent,
-    initialTokensUsed,
-  }
-
-  return createHooks(pluginContext)
-}
-
-// opencode's plugin loader (v1.x) prefers a `PluginModule` default export
-// (`{ id, server }`). When the default is a raw function instead, the loader
-// falls back to iterating EVERY named export and requires each to be a
-// function — which trips on non-function exports like
-// `DEFAULT_TRIGGER_IGNORE_TAGS` (an array), producing:
-//   "Plugin export is not a function"
-// Exporting a module object keeps the named exports intact for programmatic
-// consumers while satisfying the modern loader path.
-//
-// Defined structurally (rather than importing `PluginModule` from
-// `@opencode-ai/plugin`) so this compiles against older SDK type packages
-// that predate the `PluginModule` export, while still satisfying the
-// current opencode runtime contract.
-const pluginModule: {
-  id?: string
-  server: Plugin
-} = {
-  id: "preload-skills",
-  server: PreloadSkillsPlugin,
-}
-
-export default pluginModule
+    return () => controller.abort()
+  },
+})
